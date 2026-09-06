@@ -1,7 +1,8 @@
 name: iOS Build
 
 on:
-
+  push:
+    branches: [ main, master ]
   pull_request:
   workflow_dispatch:
 
@@ -13,38 +14,35 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: true
+          submodules: recursive
 
       - name: Select Xcode version
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: "16.4"
-
+          xcode-version: "latest-stable"
 
       - name: Build and Archive
         run: |
-          set -o pipefail
           xcodebuild clean archive \
             -project "LiveContainer.xcodeproj" \
             -scheme "LiveContainer" \
             -configuration Release \
             -archivePath $PWD/build/LiveContainer.xcarchive \
             -destination "generic/platform=iOS" \
-            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
-          | xcpretty
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
 
       - name: Create IPA
         run: |
           mkdir -p build/Payload
-          cp -r build/LiveContainer.xcarchive/Products/Applications/FlekDeck.app build/Payload/
+          cp -r build/LiveContainer.xcarchive/Products/Applications/*.app build/Payload/
           cd build
-          zip -r LiveContainer.ipa Payload
+          zip -qr FlekDeck.ipa Payload
           rm -rf Payload
-          echo "IPA created successfully:"
-          ls -lh LiveContainer.ipa
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LiveContainer.ipa
-          path: build/LiveContainer.ipa
+          name: FlekDeck-IPA
+          path: build/FlekDeck.ipa
