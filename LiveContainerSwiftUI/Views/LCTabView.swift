@@ -17,7 +17,7 @@ struct LCTabView: View {
     
     @State var previousSelectedTab : LCTabIdentifier = .apps
     @State private var isBlocked = false
-    @State private var hasCheckedBlockedStatus = false
+    @State private var hasCheckedBlockedStatus = true
     @State private var didFailBlockedStatusCheck = false
     @State private var didRunPostGateStartup = false
     @State private var isVerifyingAccess = false
@@ -38,28 +38,10 @@ struct LCTabView: View {
     let pub = NotificationCenter.default.publisher(for: UIScene.didDisconnectNotification)
     
     var body: some View {
-        Group {
-            if !hasCheckedBlockedStatus {
-                ZStack {
-                    Color.black.ignoresSafeArea()
-                    ProgressView()
-                        .tint(.white)
-                }
-            } else if didFailBlockedStatusCheck {
-                AccessVerificationFailedView(message: accessVerificationFailureMessage) {
-                    Task {
-                        await verifyAccess(forceNetworkCheck: true)
-                    }
-                }
-            } else if isBlocked {
-                AccessBlockedView(reason: blockedReason, message: blockedMessage)
-            } else {
-                // FlekDeck: the springboard home screen replaces the old tab bar.
-                // Settings and the Installer are now opened as full-screen pages from
-                // the home screen instead of being separate tabs.
-                LCAppListView(searchContext: searchContextAppList)
-            }
+                Group {
+            LCAppListView(searchContext: searchContextAppList)
         }
+
         .modifier(DeferBottomHomeGestureModifier())
         .alert("lc.common.error".loc, isPresented: $errorShow) {
             Button("lc.common.ok".loc) {}
@@ -93,11 +75,12 @@ struct LCTabView: View {
                 .navigationBarTitleDisplayMode(.inline)
             }
         }
-        .task {
+                .task {
             setupInitialRepositoriesIfNeeded()
             Task { await MultiRepoSearchModel.prefetchAllRepos() }
-            await verifyAccess()
+            runPostGateStartupIfNeeded()
         }
+
         .onReceive(pub) { out in
             if let scene1 = sceneDelegate.window?.windowScene, let scene2 = out.object as? UIWindowScene, scene1 == scene2 {
                 if shouldToggleMainWindowOpen {
@@ -113,20 +96,12 @@ struct LCTabView: View {
         .onChange(of: betaBannerOverride) { _ in
             updateBetaOverlay()
         }
-        .onChange(of: scenePhase) { newPhase in
-            // `.task` fires once per process, so without this an app the user
-            // never swipes away would be checked exactly once and never again:
-            // a ban issued afterwards would not land until iOS happened to
-            // terminate it. The 24h freshness test inside keeps this to at most
-            // one request per day — every other foreground is served by cache
-            // and makes no network call at all.
+                .onChange(of: scenePhase) { newPhase in
             guard newPhase == .active else {
                 return
             }
-            Task {
-                await verifyAccess()
-            }
         }
+
         .onOpenURL { url in
             dispatchURL(url: url)
         }
@@ -338,14 +313,10 @@ struct LCTabView: View {
     /// first `await` is what makes the guard reliable.
     @MainActor
     private func verifyAccess(forceNetworkCheck: Bool = false) async {
-        guard !isVerifyingAccess else {
-            return
-        }
-        isVerifyingAccess = true
-        await refreshBlockedStatus(forceNetworkCheck: forceNetworkCheck)
+        applyAccessGranted()
         runPostGateStartupIfNeeded()
-        isVerifyingAccess = false
     }
+
 
     private func refreshBlockedStatus(forceNetworkCheck: Bool = false) async {
         #if targetEnvironment(simulator)
