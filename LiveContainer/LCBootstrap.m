@@ -258,35 +258,17 @@ static void *getAppEntryPoint(void *handle) {
     return (void *)header + entryoff;
 }
 
-// Access gate for guest app launches.
-//
-// The SwiftUI launcher can only refuse to draw its own UI. A guest app started
-// from the "Launch App" Shortcuts intent, or from a leftover "selected" key,
-// reaches invokeAppMain() below without LiveContainerSwiftUI ever being loaded,
-// so the check there never runs. This is the one point every launch path passes
-// through, which makes it the only place a ban can actually be enforced.
-//
-// Cache only, never network: this sits on the launch path of every guest app
-// and must not add latency or fail when offline. LiveContainerSwiftUI owns
-// refreshing the cached verdict; see AccessVerdictStore, whose keys these are.
 static BOOL isGuestLaunchAllowed(NSUserDefaults *sharedDefaults) {
     NSNumber *checkedAt = [sharedDefaults objectForKey:@"FSAccessVerdictCheckedAt"];
-    // Nothing has ever been verified on this install. Allow, so that a launch
-    // path which legitimately cannot see the cache is not bricked by this
-    // check; the SwiftUI gate still applies the first time the launcher opens.
     if (!checkedAt) {
         return YES;
     }
 
-    // A ban is sticky and has no expiry, matching the Swift side: going offline
-    // or leaving the app closed must not be a way to shed it.
     if ([sharedDefaults boolForKey:@"FSAccessVerdictIsBanned"]) {
         return NO;
     }
 
     NSTimeInterval age = NSDate.date.timeIntervalSince1970 - checkedAt.doubleValue;
-    // A clock wound backwards shows up as a negative age. Treat it as expired
-    // rather than as an arbitrarily fresh verdict.
     if (age < 0) {
         return NO;
     }
@@ -302,6 +284,26 @@ static BOOL isGuestLaunchAllowed(NSUserDefaults *sharedDefaults) {
     return age <= window;
 }
 
+// 輔助函式：自動複製 Log 並備份至本地檔案
+static void handleAndCopyAppError(NSString *errorMsg) {
+    if (!errorMsg) return;
+    
+    // 1. 自動複製到系統剪貼簿
+    @try {
+        [UIPasteboard generalPasteboard].string = errorMsg;
+        NSLog(@"[LCBootstrap] Successfully copied error log to pasteboard.");
+    } @catch (NSException *e) {
+        NSLog(@"[LCBootstrap] Failed to write to pasteboard: %@", e);
+    }
+    
+    // 2. 備份 Log 到 App Group 共享目錄中的 latest_error.log
+    NSURL *appGroupPath = [NSFileManager.defaultManager containerURLForSecurityApplicationGroupIdentifier:[LCSharedUtils appGroupID]];
+    if (appGroupPath) {
+        NSString *logFilePath = [appGroupPath.path stringByAppendingPathComponent:@"latest_error.log"];
+        [errorMsg writeToFile:logFilePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+}
+
 static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContainer, int argc, char *argv[]) {
     NSString *appError = nil;
     if([[lcUserDefaults objectForKey:@"LCWaitForDebugger"] boolValue]) {
@@ -313,7 +315,6 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
             return @"JITLess mode is required since iOS 26. Please set it up in settings. \nPlease go to FlekDeck settings -> tap \"Import Flekstore certificate\" / \"Import Certificate\"";
         }
 #endif
-        // First of all, let's check if we have JIT
         for (int i = 0; i < 10 && !checkJITEnabled(); i++) {
             usleep(1000*100);
         }
@@ -324,7 +325,15 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     }
 
     NSFileManager *fm = NSFileManager.defaultManager;
-    NSString *docPath = [NSString stringWithFormat:@"%s/Documents", getenv("LC_HOME_PATH")];
+    
+    // 修正多工模式下 docPath 指向 Extension 專屬沙盒的問題
+    NSString *hostHome = [lcSharedDefaults stringForKey:@"hostHomePath"];
+    NSString *docPath = nil;
+    if (isLiveProcess && hostHome) {
+        docPath = [NSString stringWithFormat:@"%@/Documents", hostHome];
+    } else {
+        docPath = [NSString stringWithFormat:@"%s/Documents", getenv("LC_HOME_PATH")];
+    }
     
     NSURL *appGroupFolder = nil;
     
@@ -350,7 +359,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     }
     
     if(!guestAppInfo) {
-        return @"App bundle not found! Unable to read LCAppInfo.plist.";
+        return [NSString stringWithFormat:@"App bundle not found at: %@! Unable to read LCAppInfo.plist.", bundlePath];
     }
     
     if([guestAppInfo[@"doUseLCBundleId"] boolValue] ) {
@@ -379,7 +388,6 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         return @"App not found";
     }
     
-    // find container in Info.plist
     NSString* dataUUID = selectedContainer;
     if(!dataUUID) {
         dataUUID = guestAppInfo[@"LCDataUUID"];
@@ -396,7 +404,6 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     
     NSError *error;
 
-    // Setup tweak loader
     NSString *tweakFolder = nil;
     if (isSharedBundle) {
         tweakFolder = [appGroupFolder.path  stringByAppendingPathComponent:@"Tweaks"];
@@ -405,48 +412,39 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     }
     setenv("LC_GLOBAL_TWEAKS_FOLDER", tweakFolder.UTF8String, 1);
 
-    // Update TweakLoader symlink
     NSString *tweakLoaderPath = [tweakFolder stringByAppendingPathComponent:@"TweakLoader.dylib"];
     if (![fm fileExistsAtPath:tweakLoaderPath]) {
         remove(tweakLoaderPath.UTF8String);
         NSString *bundlePath = NSBundle.mainBundle.bundlePath;
         if([bundlePath hasSuffix:@"PlugIns/LiveProcess.appex"]) {
-            // traverse back to LiveContainer.app
             bundlePath = bundlePath.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent;
         }
         NSString *target = [bundlePath stringByAppendingPathComponent:@"Frameworks/TweakLoader.dylib"];
         symlink(target.UTF8String, tweakLoaderPath.UTF8String);
     }
 
-    // If JIT is enabled, bypass library validation so we can load arbitrary binaries
     bool isJitEnabled = checkJITEnabled();
     if (isJitEnabled) {
         init_bypassDyldLibValidation();
     }
 
-    // Locate dyld image name address
     const char **path = _CFGetProcessPath();
     const char *oldPath = *path;
     
-    // Overwrite @executable_path
     const char *appExecPath = appBundle.executablePath.fileSystemRepresentation;
     *path = appExecPath;
     overwriteExecPath(appExecPath);
     
-    // Overwrite NSUserDefaults
     if([guestAppInfo[@"doUseLCBundleId"] boolValue]) {
         lcGuestAppId = guestAppInfo[@"LCOrignalBundleIdentifier"];
     } else {
         lcGuestAppId = appBundle.bundleIdentifier;
-        
     }
 
-    // Overwrite home and tmp path
     NSString *newHomePath = nil;
     NSArray<NSDictionary*>* containers = guestAppInfo[@"LCContainers"];
     NSURL* bookmarkURL = nil;
 
-    // see if the container contains a bookmark. if so, resolve it and report error upon failure.
     if(containers && [containers isKindOfClass:NSArray.class]) {
         for(NSDictionary* container in containers){
             if(![container isKindOfClass:NSDictionary.class]) {
@@ -455,7 +453,6 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
             if([container[@"folderName"] isEqualToString:dataUUID]) {
                 NSData* bookmarkData = container[@"bookmarkData"];
                 if(bookmarkData && [bookmarkData isKindOfClass:NSData.class]) {
-                    // we will be killed by watchdog before timedout, so we set this error beforehand.
                     [lcUserDefaults setObject:@"Bookmark resolution timed out. Is the data storage offline?" forKey:@"error"];
                     NSError* err = nil;
                     BOOL isStale = false;
@@ -482,11 +479,9 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         newHomePath = bookmarkURL.path;
     } else if(isSharedBundle) {
         newHomePath = [NSString stringWithFormat:@"%@/Data/Application/%@", appGroupFolder.path, dataUUID];
-        
     } else {
         newHomePath = [NSString stringWithFormat:@"%@/Data/Application/%@", docPath, dataUUID];
     }
-    
     
     NSString *newTmpPath = [newHomePath stringByAppendingPathComponent:@"tmp"];
     remove(newTmpPath.UTF8String);
@@ -509,8 +504,6 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
                 [fm removeItemAtPath:inboxSymlinkPath error:&error];
             }
         }
-        
-
         symlink(inboxPath.UTF8String, inboxSymlinkPath.UTF8String);
     } else {
         NSString* inboxSymlinkPath = [NSString stringWithFormat:@"%s/%@-Inbox", getenv("TMPDIR"), [appBundle bundleIdentifier]];
@@ -520,15 +513,11 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
                 [fm removeItemAtPath:inboxSymlinkPath error:&error];
             }
         }
-
     }
     
     setenv("CFFIXED_USER_HOME", newHomePath.UTF8String, 1);
     setenv("HOME", newHomePath.UTF8String, 1);
-    // we don't change TMP's env in case some apps clear cache by directly deleting the tmp folder,
-    // which if symlinked, the new tmp cannot be recreated (#1040, #1125) or the app may camplain about the tmp folder being a symlimk (#884)
 
-    // Setup directories
     NSArray *dirList = @[@"Library/Caches", @"Library/Cookies", @"Documents", @"SystemData"];
     for (NSString *dir in dirList) {
         NSString *dirPath = [newHomePath stringByAppendingPathComponent:dir];
@@ -540,13 +529,9 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     
     [LCSharedUtils setContainerUsingByLC:lcAppUrlScheme folderName:dataUUID auditToken:0];
 
-    // Overwrite NSBundle
     overwriteMainNSBundle(appBundle);
-
-    // Overwrite CFBundle
     overwriteMainCFBundle();
 
-    // Overwrite executable info
     if(!appBundle.executablePath) {
         return @"App's executable path not found. Please try force re-signing or reinstalling this app.";
     }
@@ -558,37 +543,25 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     *_CFGetProgname() = NSProcessInfo.processInfo.processName.UTF8String;
     Class swiftNSProcessInfo = NSClassFromString(@"_NSSwiftProcessInfo");
     if(swiftNSProcessInfo) {
-        // Swizzle the arguments method to return the ObjC arguments
         SEL selector = @selector(arguments);
         method_setImplementation(class_getInstanceMethod(swiftNSProcessInfo, selector), class_getMethodImplementation(NSProcessInfo.class, selector));
     }
     
-    // hook NSUserDefault before running libraries' initializers
     NUDGuestHooksInit();
     if(!isSideStore) {
         SecItemGuestHooksInit();
         NSFMGuestHooksInit();
         initDead10ccFix();
     }
-    // No-op outside LiveProcess, and once the appex carries the key itself.
     LCHostIdentityInit();
-    // Per-window mute, and mixable audio sessions so two guests can be heard at
-    // once. Only a LiveProcess guest is ever in a multitask window.
     if(isLiveProcess && !isSideStore) {
         LCAudioMuteInit(dataUUID);
-        // The guest cannot hold a PiP window of its own — see LCGuestPiP.m — so
-        // its requests are handed to the host, which can.
         LCGuestPiPInit(dataUUID);
-        // Nor can it record — see LCGuestCapture.m. The window says so rather
-        // than letting the app fall silent with no explanation.
         LCGuestCaptureInit(dataUUID);
     }
-    // Background downloads inside LiveProcess get our app group forced onto
-    // their session configuration, which is what makes them complete.
     if(isLiveProcess) {
         NSURLSCGuestHooksInit();
     }
-    // ignore setting handler from guest app
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, NSSetUncaughtExceptionHandler, hook_do_nothing, nil);
     
     BOOL hookDlopen = !isSideStore && !isSharedBundle && LCSharedUtils.certificatePassword && isLiveProcess;
@@ -618,14 +591,13 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
             *path = oldPath;
             return appError;
         }
-        NSBundle *selected32bitLayerBundle = [NSBundle bundleWithPath:[docPath stringByAppendingPathComponent:selected32BitLayer]]; //TODO make it user friendly;
+        NSBundle *selected32bitLayerBundle = [NSBundle bundleWithPath:[docPath stringByAppendingPathComponent:selected32BitLayer]];
         if(!selected32bitLayerBundle) {
             appError = @"The specified LiveExec32.app path is not found";
             NSLog(@"[LCBootstrap] %@", appError);
             *path = oldPath;
             return appError;
         }
-        // maybe need to save selected32bitLayerBundle to static variable?
         appExecPath = strdup(selected32bitLayerBundle.executablePath.UTF8String);
     }
 #endif
@@ -633,7 +605,6 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         tweakLoaderLoaded = true;
     }
     
-    // Preload executable to bypass RT_NOLOAD
     appMainImageIndex = _dyld_image_count();
     __block void *appHandle = 0;
     void (^dlopenBlock)(void) = ^{
@@ -684,10 +655,8 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         }
     }
     
-    // Fix dynamic properties of some apps
     [NSUserDefaults performSelector:@selector(initialize)];
 
-    // Attempt to load the bundle. 32-bit bundle will always fail because of 32-bit main executable, so ignore it
     if (
 #if is32BitSupported
         !is32bit &&
@@ -701,7 +670,6 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     }
     NSLog(@"[LCBootstrap] loaded bundle");
 
-    // Find main()
     appMain = getAppEntryPoint(appHandle);
     if (!appMain) {
         appError = @"Could not find the main entry point";
@@ -710,7 +678,6 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         return appError;
     }
 
-    // Go!
     NSLog(@"[LCBootstrap] jumping to main %p", appMain);
     int ret;
 #if is32BitSupported
@@ -729,6 +696,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
 
 static void exceptionHandler(NSException *exception) {
     NSString *error = [NSString stringWithFormat:@"%@\nCall stack: %@", exception.reason, exception.callStackSymbols];
+    handleAndCopyAppError(error); // 自動複製例外 Crash Log
     if(isLiveProcess) {
         NSExtensionContext *context = [NSClassFromString(@"LiveProcessHandler") extensionContext];
         [context cancelRequestWithError:[NSError errorWithDomain:@"LiveProcess" code:1 userInfo:@{NSLocalizedDescriptionKey: error}]];
@@ -747,6 +715,11 @@ int LiveContainerMain(int argc, char *argv[]) {
     isLiveProcess = [lcAppUrlScheme isEqualToString:@"liveprocess"];
     setenv("LC_HOME_PATH", getenv("HOME"), 0);
 
+    // 如果不是在多工模式，記錄主 App 的 HOME 路徑供 Extension 存取
+    if (!isLiveProcess && getenv("HOME")) {
+        [lcSharedDefaults setObject:@(getenv("HOME")) forKey:@"hostHomePath"];
+    }
+
     NSString *selectedApp = [lcUserDefaults stringForKey:@"selected"];
     NSString *selectedContainer = [lcUserDefaults stringForKey:@"selectedContainer"];
     NSString *launchUrl = nil;
@@ -755,7 +728,6 @@ int LiveContainerMain(int argc, char *argv[]) {
             launchUrl = [lcUserDefaults stringForKey:@"launchAppUrlScheme"];
             break;
         }
-        // check launch task in shared defaults
         NSString* scheemFromLaunchExtension = [lcSharedDefaults stringForKey:@"LCLaunchExtensionScheme"];
         if(![scheemFromLaunchExtension isEqualToString:lcAppUrlScheme]) break;
         NSString* selectedAppFromLaunchExtension = [lcSharedDefaults stringForKey:@"LCLaunchExtensionBundleID"];
@@ -780,7 +752,6 @@ int LiveContainerMain(int argc, char *argv[]) {
         lastLaunchDataUUID = selectedContainer;
     }
     
-    // we put all files in app group after fixing 0xdead10cc. This call is here in case user upgraded lc with app's data in private Library/SharedDocuments
     [LCSharedUtils moveSharedAppFolderBack];
     
     if(lastLaunchDataUUID) {
@@ -792,15 +763,12 @@ int LiveContainerMain(int argc, char *argv[]) {
             NSString *docPath = [NSString stringWithFormat:@"%s/Documents", getenv("LC_HOME_PATH")];
             preferencesTo = [docPath stringByAppendingPathComponent:[NSString stringWithFormat:@"Data/Application/%@/Library/Preferences", lastLaunchDataUUID]];
         }
-        // recover preferences
-        // this is not needed anymore, it's here for backward competability
         [LCSharedUtils dumpPreferenceToPath:preferencesTo dataUUID:lastLaunchDataUUID];
         if(!isLiveProcess) {
             [lcUserDefaults removeObjectForKey:@"lastLaunchDataUUID"];
             [lcUserDefaults removeObjectForKey:@"lastLaunchType"];
         }
     }
-    // in case some weird apps remove the tmp folder
     [NSFileManager.defaultManager createDirectoryAtPath:@(getenv("TMPDIR")) withIntermediateDirectories:YES attributes:nil error:nil];
     
     if([selectedApp isEqualToString:@"ui"]) {
@@ -810,10 +778,6 @@ int LiveContainerMain(int argc, char *argv[]) {
     }
 
     if((selectedApp || [lcUserDefaults boolForKey:@"LCOpenSideStore"]) && !isGuestLaunchAllowed(lcSharedDefaults)) {
-        // Drop the pending launch and fall through to LiveContainerSwiftUI,
-        // which re-checks online and explains itself with the blocked or the
-        // verification screen. Under LiveProcess there is no UI to fall through
-        // to, so the multitask window closes instead.
         selectedApp = nil;
         selectedContainer = nil;
         launchUrl = nil;
@@ -841,8 +805,6 @@ int LiveContainerMain(int argc, char *argv[]) {
         selectedContainer = [LCSharedUtils findDefaultContainerWithBundleId:selectedApp];
     }
     NSString* runningLC = [LCSharedUtils getContainerUsingLCSchemeWithFolderName:selectedContainer];
-    // if another instance is running, we just switch to that one, these should be called after uiapplication initialized
-    // however if the running lc is liveprocess and current lc is flekdeck1 we just continue
     if(selectedApp && runningLC) {
         [lcUserDefaults removeObjectForKey:@"selected"];
         [lcUserDefaults removeObjectForKey:@"selectedContainer"];
@@ -855,7 +817,6 @@ int LiveContainerMain(int argc, char *argv[]) {
         selectedApp = nil;
         dispatch_time_t delay = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC));
         dispatch_after(delay, dispatch_get_main_queue(), ^{
-            // Base64 encode the data
             NSString* urlStr;
             if(selectedContainer) {
                 urlStr = [NSString stringWithFormat:@"%@://livecontainer-launch?bundle-name=%@&container-folder-name=%@", runningLC, selectedAppBackUp, selectedContainer];
@@ -868,11 +829,9 @@ int LiveContainerMain(int argc, char *argv[]) {
                 [[NSClassFromString(@"UIApplication") sharedApplication] openURL:url options:@{} completionHandler:nil];
                 
                 NSString *launchUrl = [lcUserDefaults stringForKey:@"launchAppUrlScheme"];
-                // also pass url scheme to another lc
                 if(launchUrl) {
                     [lcUserDefaults removeObjectForKey:@"launchAppUrlScheme"];
 
-                    // Base64 encode the data
                     NSData *data = [launchUrl dataUsingEncoding:NSUTF8StringEncoding];
                     NSString *encodedUrl = [data base64EncodedStringWithOptions:0];
                     
@@ -896,17 +855,18 @@ int LiveContainerMain(int argc, char *argv[]) {
         }
         NSString *appError = invokeAppMain(selectedApp, selectedContainer, argc, argv);
         if (appError) {
+            // **關鍵修正**：發生錯誤時第一時間自動複製到剪貼簿並寫入檔案
+            handleAndCopyAppError(appError);
+            
             if(isLiveProcess) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(100 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
                     NSExtensionContext *context = [NSClassFromString(@"LiveProcessHandler") extensionContext];
                     [context cancelRequestWithError:[NSError errorWithDomain:@"LiveProcess" code:1 userInfo:@{NSLocalizedDescriptionKey: appError}]];
                     exit(1);
                 });
-                // spin and wait for iOS to terminate
                 CFRunLoopRun();
             } else {
                 [lcUserDefaults setObject:appError forKey:@"error"];
-                // potentially unrecovable state, exit now
                 return 1;
             }
         }
@@ -917,7 +877,6 @@ int LiveContainerMain(int argc, char *argv[]) {
         return 0;
     }
     
-    // put back cookies
     NSFileManager *fm = [NSFileManager defaultManager];
     NSURL *libraryURL = [fm URLsForDirectory:NSLibraryDirectory inDomains:NSUserDomainMask].firstObject;;
     NSURL *cookies2URL = [libraryURL URLByAppendingPathComponent:@"Cookies2"];
@@ -926,7 +885,6 @@ int LiveContainerMain(int argc, char *argv[]) {
     if ([fm fileExistsAtPath:cookies2URL.path isDirectory:&isDir] && isDir) {
         NSError *error = nil;
         NSURL *cookiesURL  = [libraryURL URLByAppendingPathComponent:@"Cookies"];
-        // Remove old Caches folder if exists
         if ([fm fileExistsAtPath:cookiesURL.path]) {
             if ([fm removeItemAtURL:cookiesURL error:&error]) {
                 [fm moveItemAtURL:cookies2URL toURL:cookiesURL error:&error];
