@@ -576,6 +576,12 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     // once. Only a LiveProcess guest is ever in a multitask window.
     if(isLiveProcess && !isSideStore) {
         LCAudioMuteInit(dataUUID);
+        // The guest cannot hold a PiP window of its own — see LCGuestPiP.m — so
+        // its requests are handed to the host, which can.
+        LCGuestPiPInit(dataUUID);
+        // Nor can it record — see LCGuestCapture.m. The window says so rather
+        // than letting the app fall silent with no explanation.
+        LCGuestCaptureInit(dataUUID);
     }
     // Background downloads inside LiveProcess get our app group forced onto
     // their session configuration, which is what makes them complete.

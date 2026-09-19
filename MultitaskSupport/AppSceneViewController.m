@@ -9,6 +9,7 @@
 #import "LiveContainerSwiftUI-Swift.h"
 #import "../LiveContainerSwiftUI/Utilities/LCUtils.h"
 #import "PiPManager.h"
+#import "LCGuestCaptureNotice.h"
 #import "Localization.h"
 #import "LCSharedUtils.h"
 #import "utils.h"
@@ -289,6 +290,12 @@ static void LCUnstageAppFromAppGroup(NSString *bundleId, NSString *dataUUID, BOO
 @property(nonatomic) NSString *sceneID;
 @property(nonatomic) NSExtension* extension;
 @property(nonatomic, readwrite) bool isAppTerminationCleanUpCalled;
+/// Registrations on the guest's PiP requests, for as long as the guest is running.
+@property(nonatomic) NSNumber *pipStartToken;
+@property(nonatomic) NSNumber *pipStopToken;
+@property(nonatomic) NSNumber *pipReadyToken;
+/// Raises the Single Mode sheet when the guest is refused the microphone.
+@property(nonatomic) LCGuestCaptureNotice *captureNotice;
 @end
 
 /// The device orientation to hand a guest, derived from the orientation UIKit has
@@ -608,6 +615,9 @@ static UIDeviceOrientation LCDeviceOrientationForInterface(UIInterfaceOrientatio
     
     [self.view.window.windowScene _registerSettingsDiffActionArray:@[self] forKey:self.sceneID];
 
+    [self beginObservingGuestPiPRequests];
+    [self beginObservingGuestCaptureRefusals];
+
     if([self.delegate respondsToSelector:@selector(appSceneVCDidPresentScene:)]) {
         [self.delegate appSceneVCDidPresentScene:self];
     }
@@ -758,6 +768,9 @@ static UIDeviceOrientation LCDeviceOrientationForInterface(UIInterfaceOrientatio
     _isAppTerminationCleanUpCalled = true;
 
     [_audio invalidate];
+    [self endObservingGuestPiPRequests];
+    [_captureNotice invalidate];
+    _captureNotice = nil;
 
     dispatch_async(dispatch_get_main_queue(), ^{
         // Bring the guest's container back and release the staged bundle. This
@@ -797,6 +810,183 @@ static UIDeviceOrientation LCDeviceOrientationForInterface(UIInterfaceOrientatio
         [self.delegate appSceneVCAppDidExit:self];
         [MultitaskManager unregisterMultitaskContainerWithContainer:self.dataUUID];
     });
+}
+
+#pragma mark - Guest PiP requests
+
+/// Listens for the guest asking to be put into Picture in Picture.
+///
+/// A guest cannot hold a PiP window of its own: the window's content is a scene
+/// SpringBoard creates with the requesting process as its scene client, and
+/// FrontBoard refuses to make an app extension one, so the guest's own attempt
+/// produces a window that is permanently black. LiveContainer, being an ordinary
+/// installed app, has no such trouble. So LCGuestPiP swallows the request inside
+/// the guest and posts it here instead, and the window floats the way any other
+/// window does when PiP is chosen from its card.
+///
+/// Registered once the guest is running, which is the earliest anything can ask.
+- (void)beginObservingGuestPiPRequests {
+    if(self.pipStartToken || self.pipStopToken) return;
+    // The same fixed literal keyed by container that LCAudioMute's channel uses,
+    // and for the same reason: the two processes each work the app group id out
+    // for themselves, and they only have to disagree once for every request to
+    // vanish.
+    NSString *base = [NSString stringWithFormat:@"com.kdt.livecontainer.pip.%@", self.dataUUID];
+    __weak typeof(self) weakSelf = self;
+
+    int startToken = 0;
+    if(notify_register_dispatch([base stringByAppendingString:@".start"].UTF8String, &startToken,
+                                dispatch_get_main_queue(), ^(int token) {
+        // The request carries the id of the CAContext the guest's video is being
+        // rendered into, in the name's 64-bit state. A sample buffer layer holds
+        // no pixels — its video is decoded out of process and reaches the layer
+        // as a hosted context — so this number is the whole of the video, and
+        // the host can host it exactly as the guest does.
+        uint64_t state = 0;
+        notify_get_state(token, &state);
+        [weakSelf handleGuestPiPStartWithPayload:state];
+    }) == NOTIFY_STATUS_OK) {
+        self.pipStartToken = @(startToken);
+    }
+
+    int readyToken = 0;
+    if(notify_register_dispatch([base stringByAppendingString:@".videoready"].UTF8String, &readyToken,
+                                dispatch_get_main_queue(), ^(int token) {
+        uint64_t state = 0;
+        notify_get_state(token, &state);
+        [weakSelf handleGuestVideoReady:CGSizeMake(state & 0xFFFF, (state >> 16) & 0xFFFF)];
+    }) == NOTIFY_STATUS_OK) {
+        self.pipReadyToken = @(readyToken);
+    }
+
+    int stopToken = 0;
+    if(notify_register_dispatch([base stringByAppendingString:@".stop"].UTF8String, &stopToken,
+                                dispatch_get_main_queue(), ^(int token) {
+        [weakSelf handleGuestPiPStop];
+    }) == NOTIFY_STATUS_OK) {
+        self.pipStopToken = @(stopToken);
+    }
+}
+
+/// Listens for the guest being refused the microphone.
+///
+/// iOS does not let an app extension record, and every multitask guest is one,
+/// so a call placed in a window like this is silent in both directions — the
+/// Voice Processing unit a VoIP app drives does capture and playback together,
+/// and the refusal stops the whole unit rather than just its microphone half.
+/// Nothing surfaces: the call connects, the timer runs, and neither side is
+/// heard. LCGuestCapture watches for the refusal inside the guest and posts it
+/// here, and the window raises a sheet explaining that the microphone needs
+/// Single Mode, and how to get there.
+///
+/// Registered once the guest is running, which is the earliest anything can fail.
+- (void)beginObservingGuestCaptureRefusals {
+    if(self.captureNotice) return;
+    self.captureNotice = [[LCGuestCaptureNotice alloc] initWithDataUUID:self.dataUUID];
+    self.captureNotice.hostViewController = self;
+}
+
+- (void)endObservingGuestPiPRequests {
+    if(self.pipStartToken) {
+        notify_cancel(self.pipStartToken.intValue);
+        self.pipStartToken = nil;
+    }
+    if(self.pipStopToken) {
+        notify_cancel(self.pipStopToken.intValue);
+        self.pipStopToken = nil;
+    }
+    if(self.pipReadyToken) {
+        notify_cancel(self.pipReadyToken.intValue);
+        self.pipReadyToken = nil;
+    }
+}
+
+/// The guest has a video and has said how big it is, long before anything floats.
+/// Re-arms, so the controller standing ready is the video-shaped one.
+- (void)handleGuestVideoReady:(CGSize)size {
+    if(size.width < 1 || size.height < 1) return;
+    if(self.guestHasVideo && CGSizeEqualToSize(self.guestVideoSize, size)) return;
+    NSLog(@"[LC] %@ has a video, %dx%d", self.bundleId, (int)size.width, (int)size.height);
+    self.guestHasVideo = YES;
+    self.guestVideoSize = size;
+    self.guestVideoRect = CGRectMake(0, 0, size.width, size.height);
+    [PiPManager.shared rearmForVC:self];
+}
+
+- (void)notifyGuestPiPStarted {
+    NSString *name = [NSString stringWithFormat:@"com.kdt.livecontainer.pip.%@.started", self.dataUUID];
+    notify_post(name.UTF8String);
+}
+
+- (void)requestGuestFloat {
+    if(!self.guestHasVideo) return;
+    NSString *name = [NSString stringWithFormat:@"com.kdt.livecontainer.pip.%@.float", self.dataUUID];
+    notify_post(name.UTF8String);
+}
+
+- (void)notifyGuestPiPEnded {
+    // The guest has its video layer out of its own tree for as long as the window
+    // is floating, so it has to be told the moment that is over — including when
+    // PiP was ended by the PiP window's own buttons, which the app never sees.
+    NSString *name = [NSString stringWithFormat:@"com.kdt.livecontainer.pip.%@.ended", self.dataUUID];
+    notify_post(name.UTF8String);
+}
+
+- (void)handleGuestPiPStartWithPayload:(uint64_t)payload {
+    if((uint32_t)payload == 0) {
+        // The guest asked to float but could not find its video, so the whole
+        // window is floated instead — the old behaviour, and better than a PiP
+        // button that does nothing. Its claim to have a video is dropped too:
+        // whatever it reported the shape of, it cannot publish it.
+        NSLog(@"[LC] %@ asked to float but has no video to publish; floating the window", self.bundleId);
+        self.guestHasVideo = NO;
+        self.guestVideoContextId = 0;
+        if(PiPManager.hasShared && [PiPManager.shared isPiPWithVC:self]) return;
+        [PiPManager.shared disarmIfInactiveForVC:self];
+        [PiPManager.shared startPiPWithVC:self];
+        return;
+    }
+
+    // Packed by LCGuestPiP: the context id in the low 32 bits, then the video's
+    // width and height in the two 16-bit fields above it.
+    self.guestVideoContextId = (uint32_t)payload;
+    self.guestVideoSize = CGSizeMake((payload >> 32) & 0xFFFF, (payload >> 48) & 0xFFFF);
+
+    // Set by the guest before it posted the request, so it is already there. A
+    // field to a quarter of the state: x, y, width, height.
+    uint64_t rect = 0;
+    int rectToken = 0;
+    NSString *rectName = [NSString stringWithFormat:@"com.kdt.livecontainer.pip.%@.videorect", self.dataUUID];
+    if(notify_register_check(rectName.UTF8String, &rectToken) == NOTIFY_STATUS_OK) {
+        notify_get_state(rectToken, &rect);
+        notify_cancel(rectToken);
+    }
+    CGRect videoRect = CGRectMake(rect & 0xFFFF, (rect >> 16) & 0xFFFF,
+                                  (rect >> 32) & 0xFFFF, (rect >> 48) & 0xFFFF);
+    // Nothing usable reported: show the context whole rather than nothing at all.
+    if(videoRect.size.width < 1 || videoRect.size.height < 1) {
+        videoRect = CGRectMake(0, 0, self.guestVideoSize.width, self.guestVideoSize.height);
+    }
+    self.guestVideoRect = videoRect;
+    NSLog(@"[LC] %@ asked to float, video context %u (%dx%d), picture at %d,%d %dx%d",
+          self.bundleId, self.guestVideoContextId,
+          (int)self.guestVideoSize.width, (int)self.guestVideoSize.height,
+          (int)videoRect.origin.x, (int)videoRect.origin.y,
+          (int)videoRect.size.width, (int)videoRect.size.height);
+    // Already floating: the app asked twice, or asked for something it is
+    // already getting. Starting again would take the window down and put it
+    // back up for no visible reason.
+    if(PiPManager.hasShared && [PiPManager.shared isPiPWithVC:self]) return;
+    [PiPManager.shared startPiPWithVC:self];
+}
+
+- (void)handleGuestPiPStop {
+    // Asked through hasShared first, as everywhere else: no manager, no PiP to
+    // leave. A guest asking to stop one it was never in is an ordinary case —
+    // the hook posts whatever the app asks for.
+    if(PiPManager.hasShared && [PiPManager.shared isPiPWithVC:self]) {
+        [PiPManager.shared stopPiP];
+    }
 }
 
 // Created on first use rather than at init: a window that is never touched
