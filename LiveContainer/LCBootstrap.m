@@ -284,24 +284,50 @@ static BOOL isGuestLaunchAllowed(NSUserDefaults *sharedDefaults) {
     return age <= window;
 }
 
-// 輔助函式：自動複製 Log 並備份至本地檔案
+// 輔助函式：自動備份 Log 至 App Group 實體檔案
 static void handleAndCopyAppError(NSString *errorMsg) {
     if (!errorMsg) return;
     
-    // 1. 自動複製到系統剪貼簿
-    @try {
-        [UIPasteboard generalPasteboard].string = errorMsg;
-        NSLog(@"[LCBootstrap] Successfully copied error log to pasteboard.");
-    } @catch (NSException *e) {
-        NSLog(@"[LCBootstrap] Failed to write to pasteboard: %@", e);
-    }
-    
-    // 2. 備份 Log 到 App Group 共享目錄中的 latest_error.log
+    // 備份 Log 到 App Group 共享目錄中的 latest_error.log
     NSURL *appGroupPath = [NSFileManager.defaultManager containerURLForSecurityApplicationGroupIdentifier:[LCSharedUtils appGroupID]];
     if (appGroupPath) {
         NSString *logFilePath = [appGroupPath.path stringByAppendingPathComponent:@"latest_error.log"];
         [errorMsg writeToFile:logFilePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
+}
+
+// 關鍵修改：顯示常駐 Alert，徹底不關閉 App，並提供手動複製按鈕
+static void showPersistentErrorAlert(NSString *appError) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *window = nil;
+        for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if (scene.activationState == UISceneActivationStateForegroundActive) {
+                for (UIWindow *w in scene.windows) {
+                    if (w.isKeyWindow) { window = w; break; }
+                }
+            }
+        }
+        if (!window) window = UIApplication.sharedApplication.keyWindow;
+        
+        UIViewController *rootVC = window.rootViewController;
+        while (rootVC.presentedViewController) {
+            rootVC = rootVC.presentedViewController;
+        }
+        
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"App 載入錯誤 Log"
+                                                                       message:appError
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        
+        [alert addAction:[UIAlertAction actionWithTitle:@"複製 Log 到剪貼簿" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            [UIPasteboard generalPasteboard].string = appError;
+        }]];
+        
+        [alert addAction:[UIAlertAction actionWithTitle:@"手動退出" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+            exit(1);
+        }]];
+        
+        [rootVC presentViewController:alert animated:YES completion:nil];
+    });
 }
 
 static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContainer, int argc, char *argv[]) {
@@ -326,7 +352,6 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
 
     NSFileManager *fm = NSFileManager.defaultManager;
     
-    // 修正多工模式下 docPath 指向 Extension 專屬沙盒的問題
     NSString *hostHome = [lcSharedDefaults stringForKey:@"hostHomePath"];
     NSString *docPath = nil;
     if (isLiveProcess && hostHome) {
@@ -349,7 +374,6 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
 
     guestAppInfo = [NSDictionary dictionaryWithContentsOfFile:[NSString stringWithFormat:@"%@/LCAppInfo.plist", bundlePath]];
 
-    // not found locally, let's look for the app in shared folder
     if(!guestAppInfo) {
         NSURL *appGroupPath = [NSFileManager.defaultManager containerURLForSecurityApplicationGroupIdentifier:[LCSharedUtils appGroupID]];
         appGroupFolder = [appGroupPath URLByAppendingPathComponent:@"LiveContainer"];
@@ -696,10 +720,12 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
 
 static void exceptionHandler(NSException *exception) {
     NSString *error = [NSString stringWithFormat:@"%@\nCall stack: %@", exception.reason, exception.callStackSymbols];
-    handleAndCopyAppError(error); // 自動複製例外 Crash Log
+    handleAndCopyAppError(error);
     if(isLiveProcess) {
         NSExtensionContext *context = [NSClassFromString(@"LiveProcessHandler") extensionContext];
         [context cancelRequestWithError:[NSError errorWithDomain:@"LiveProcess" code:1 userInfo:@{NSLocalizedDescriptionKey: error}]];
+        showPersistentErrorAlert(error);
+        CFRunLoopRun();
     } else {
         [lcUserDefaults setObject:error forKey:@"error"];
     }
@@ -715,7 +741,6 @@ int LiveContainerMain(int argc, char *argv[]) {
     isLiveProcess = [lcAppUrlScheme isEqualToString:@"liveprocess"];
     setenv("LC_HOME_PATH", getenv("HOME"), 0);
 
-    // 如果不是在多工模式，記錄主 App 的 HOME 路徑供 Extension 存取
     if (!isLiveProcess && getenv("HOME")) {
         [lcSharedDefaults setObject:@(getenv("HOME")) forKey:@"hostHomePath"];
     }
@@ -855,15 +880,12 @@ int LiveContainerMain(int argc, char *argv[]) {
         }
         NSString *appError = invokeAppMain(selectedApp, selectedContainer, argc, argv);
         if (appError) {
-            // **關鍵修正**：發生錯誤時第一時間自動複製到剪貼簿並寫入檔案
             handleAndCopyAppError(appError);
             
             if(isLiveProcess) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(100 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
-                    NSExtensionContext *context = [NSClassFromString(@"LiveProcessHandler") extensionContext];
-                    [context cancelRequestWithError:[NSError errorWithDomain:@"LiveProcess" code:1 userInfo:@{NSLocalizedDescriptionKey: appError}]];
-                    exit(1);
-                });
+                // 已刪除 dispatch_after 與 exit(1)
+                // 透過 showPersistentErrorAlert 彈出視窗並保持 RunLoop，畫面將不會關閉
+                showPersistentErrorAlert(appError);
                 CFRunLoopRun();
             } else {
                 [lcUserDefaults setObject:appError forKey:@"error"];
