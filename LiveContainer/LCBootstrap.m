@@ -88,6 +88,101 @@ bool sideStoreExist = false;
 }
 @end
 
+#pragma mark - Crash Log Helper Functions
+
+static NSString* getCrashLogFolder(void) {
+    const char *homePath = getenv("LC_HOME_PATH");
+    if (!homePath) {
+        homePath = getenv("HOME");
+    }
+    NSString *docPath = [NSString stringWithFormat:@"%s/Documents/CrashLogs", homePath];
+    NSFileManager *fm = NSFileManager.defaultManager;
+    if (![fm fileExistsAtPath:docPath]) {
+        [fm createDirectoryAtPath:docPath withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+    return docPath;
+}
+
+static void writeCrashLogToFile(NSString *content) {
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    [formatter setDateFormat:@"yyyy-MM-dd_HH-mm-ss"];
+    NSString *timestamp = [formatter stringFromDate:[NSDate date]];
+    
+    NSString *appName = lcGuestAppId ? lcGuestAppId : @"UnknownApp";
+    NSString *fileName = [NSString stringWithFormat:@"Crash_%@_%@.log", appName, timestamp];
+    NSString *filePath = [getCrashLogFolder() stringByAppendingPathComponent:fileName];
+    
+    [content writeToFile:filePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+static void exceptionHandler(NSException *exception) {
+    NSString *error = [NSString stringWithFormat:@"================ NSException Crash Log ================\n"
+                       @"App ID: %@\n"
+                       @"Name: %@\n"
+                       @"Reason: %@\n"
+                       @"Call Stack:\n%@\n"
+                       @"=======================================================",
+                       lcGuestAppId ? lcGuestAppId : @"Unknown",
+                       exception.name,
+                       exception.reason,
+                       [exception.callStackSymbols componentsJoinedByString:@"\n"]];
+    
+    writeCrashLogToFile(error);
+    
+    if(isLiveProcess) {
+        NSExtensionContext *context = [NSClassFromString(@"LiveProcessHandler") extensionContext];
+        [context cancelRequestWithError:[NSError errorWithDomain:@"LiveProcess" code:1 userInfo:@{NSLocalizedDescriptionKey: error}]];
+    } else {
+        [lcUserDefaults setObject:error forKey:@"error"];
+    }
+}
+
+static void signalHandler(int sig, siginfo_t *info, void *ucontext) {
+    void *callstack[128];
+    int frames = backtrace(callstack, 128);
+    char **strs = backtrace_symbols(callstack, frames);
+    
+    NSMutableString *stackTrace = [NSMutableString string];
+    if (strs) {
+        for (int i = 0; i < frames; i++) {
+            [stackTrace appendFormat:@"%s\n", strs[i]];
+        }
+        free(strs);
+    }
+    
+    NSString *error = [NSString stringWithFormat:@"================ Signal Crash Log ================\n"
+                       @"App ID: %@\n"
+                       @"Signal: %d\n"
+                       @"Call Stack:\n%@"
+                       @"==================================================",
+                       lcGuestAppId ? lcGuestAppId : @"Unknown",
+                       sig,
+                       stackTrace];
+    
+    writeCrashLogToFile(error);
+    
+    // 恢復預設 Handler 並重新觸發 Signal 以供系統進行預期處置
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void setupCrashHandlers(void) {
+    NSSetUncaughtExceptionHandler(&exceptionHandler);
+    
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = signalHandler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
+}
+
+#pragma mark - Core Bootstrap Logic
+
 static BOOL checkJITEnabled() {
 #if TARGET_OS_MACCATALYST || TARGET_OS_SIMULATOR
     return YES;
@@ -157,17 +252,12 @@ void overwriteMainCFBundle(void) {
 }
 
 void overwriteMainNSBundle(NSBundle *newBundle) {
-    // Overwrite NSBundle.mainBundle
-    // iOS 16: x19 is _MergedGlobals
-    // iOS 17: x19 is _MergedGlobals+4
-
     NSString *oldPath = NSBundle.mainBundle.executablePath;
     uint32_t *mainBundleImpl = (uint32_t *)method_getImplementation(class_getClassMethod(NSBundle.class, @selector(mainBundle)));
     for (int i = 0; i < 20; i++) {
         void **_MergedGlobals = (void **)aarch64_emulate_adrp_add(mainBundleImpl[i], mainBundleImpl[i+1], (uint64_t)&mainBundleImpl[i]);
         if (!_MergedGlobals) continue;
 
-        // In iOS 17, adrp+add gives _MergedGlobals+4, so it uses ldur instruction instead of ldr
         if ((mainBundleImpl[i+4] & 0xFF000000) == 0xF8000000) {
             uint64_t ptr = (uint64_t)_MergedGlobals - 4;
             _MergedGlobals = (void **)ptr;
@@ -202,7 +292,6 @@ int hook__NSGetExecutablePath_overwriteExecPath(DyldAPI* dyldApiInstancePtr, cha
     assert(dyldConfig != 0);
     
     char** mainExecutablePathPtr = 0;
-    // mainExecutablePath is at 0x10 for iOS 15~18.3.2, 0x20 for iOS 18.4+
     if(dyldConfig->mainExecutablePath_old != 0 && dyldConfig->mainExecutablePath_old[0] == '/') {
         mainExecutablePathPtr = &(dyldConfig->mainExecutablePath_old);
     } else if (dyldConfig->mainExecutablePath_18_4 != 0 && dyldConfig->mainExecutablePath_18_4[0] == '/') {
@@ -218,7 +307,6 @@ int hook__NSGetExecutablePath_overwriteExecPath(DyldAPI* dyldApiInstancePtr, cha
     }
     *mainExecutablePathPtr = newPath;
     
-    // in iOS 27, the length is also cached, it's at +0x28
     if(@available(iOS 27.0, *)) {
         dyldConfig->mainExecutablePathLen_27_0 = strlen(newPath);
     }
@@ -231,12 +319,9 @@ int hook__NSGetExecutablePath_overwriteExecPath(DyldAPI* dyldApiInstancePtr, cha
 }
 
 void overwriteExecPath(const char *newExecPath) {
-    // dyld4 stores executable path in a different place (iOS 15.0 +)
-    // https://github.com/apple-oss-distributions/dyld/blob/ce1cc2088ef390df1c48a1648075bbd51c5bbc6a/dyld/DyldAPIs.cpp#L802
     int (*orig__NSGetExecutablePath)(void* dyldPtr, char* buf, uint32_t* bufsize);
     performHookDyldApi("_NSGetExecutablePath", 2, (void**)&orig__NSGetExecutablePath, hook__NSGetExecutablePath_overwriteExecPath);
     _NSGetExecutablePath((char*)newExecPath, NULL);
-    // put the original function back
     performHookDyldApi("_NSGetExecutablePath", 2, (void**)&orig__NSGetExecutablePath, orig__NSGetExecutablePath);
 }
 
@@ -284,52 +369,6 @@ static BOOL isGuestLaunchAllowed(NSUserDefaults *sharedDefaults) {
     return age <= window;
 }
 
-// 輔助函式：自動備份 Log 至 App Group 實體檔案
-static void handleAndCopyAppError(NSString *errorMsg) {
-    if (!errorMsg) return;
-    
-    // 備份 Log 到 App Group 共享目錄中的 latest_error.log
-    NSURL *appGroupPath = [NSFileManager.defaultManager containerURLForSecurityApplicationGroupIdentifier:[LCSharedUtils appGroupID]];
-    if (appGroupPath) {
-        NSString *logFilePath = [appGroupPath.path stringByAppendingPathComponent:@"latest_error.log"];
-        [errorMsg writeToFile:logFilePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    }
-}
-
-// 關鍵修改：顯示常駐 Alert，徹底不關閉 App，並提供手動複製按鈕
-static void showPersistentErrorAlert(NSString *appError) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *window = nil;
-        for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
-            if (scene.activationState == UISceneActivationStateForegroundActive) {
-                for (UIWindow *w in scene.windows) {
-                    if (w.isKeyWindow) { window = w; break; }
-                }
-            }
-        }
-        if (!window) window = UIApplication.sharedApplication.keyWindow;
-        
-        UIViewController *rootVC = window.rootViewController;
-        while (rootVC.presentedViewController) {
-            rootVC = rootVC.presentedViewController;
-        }
-        
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"App 載入錯誤 Log"
-                                                                       message:appError
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        
-        [alert addAction:[UIAlertAction actionWithTitle:@"複製 Log 到剪貼簿" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            [UIPasteboard generalPasteboard].string = appError;
-        }]];
-        
-        [alert addAction:[UIAlertAction actionWithTitle:@"手動退出" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
-            exit(1);
-        }]];
-        
-        [rootVC presentViewController:alert animated:YES completion:nil];
-    });
-}
-
 static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContainer, int argc, char *argv[]) {
     NSString *appError = nil;
     if([[lcUserDefaults objectForKey:@"LCWaitForDebugger"] boolValue]) {
@@ -351,14 +390,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     }
 
     NSFileManager *fm = NSFileManager.defaultManager;
-    
-    NSString *hostHome = [lcSharedDefaults stringForKey:@"hostHomePath"];
-    NSString *docPath = nil;
-    if (isLiveProcess && hostHome) {
-        docPath = [NSString stringWithFormat:@"%@/Documents", hostHome];
-    } else {
-        docPath = [NSString stringWithFormat:@"%s/Documents", getenv("LC_HOME_PATH")];
-    }
+    NSString *docPath = [NSString stringWithFormat:@"%s/Documents", getenv("LC_HOME_PATH")];
     
     NSURL *appGroupFolder = nil;
     
@@ -383,7 +415,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     }
     
     if(!guestAppInfo) {
-        return [NSString stringWithFormat:@"App bundle not found at: %@! Unable to read LCAppInfo.plist.", bundlePath];
+        return @"App bundle not found! Unable to read LCAppInfo.plist.";
     }
     
     if([guestAppInfo[@"doUseLCBundleId"] boolValue] ) {
@@ -528,6 +560,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
                 [fm removeItemAtPath:inboxSymlinkPath error:&error];
             }
         }
+
         symlink(inboxPath.UTF8String, inboxSymlinkPath.UTF8String);
     } else {
         NSString* inboxSymlinkPath = [NSString stringWithFormat:@"%s/%@-Inbox", getenv("TMPDIR"), [appBundle bundleIdentifier]];
@@ -718,19 +751,6 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     return [NSString stringWithFormat:@"App returned from its main function with code %d.", ret];
 }
 
-static void exceptionHandler(NSException *exception) {
-    NSString *error = [NSString stringWithFormat:@"%@\nCall stack: %@", exception.reason, exception.callStackSymbols];
-    handleAndCopyAppError(error);
-    if(isLiveProcess) {
-        NSExtensionContext *context = [NSClassFromString(@"LiveProcessHandler") extensionContext];
-        [context cancelRequestWithError:[NSError errorWithDomain:@"LiveProcess" code:1 userInfo:@{NSLocalizedDescriptionKey: error}]];
-        showPersistentErrorAlert(error);
-        CFRunLoopRun();
-    } else {
-        [lcUserDefaults setObject:error forKey:@"error"];
-    }
-}
-
 int LiveContainerMain(int argc, char *argv[]) {
     lcMainBundle = [NSBundle mainBundle];
     lcUserDefaults = NSUserDefaults.standardUserDefaults;
@@ -740,10 +760,6 @@ int LiveContainerMain(int argc, char *argv[]) {
     lcAppGroupPath = [[NSFileManager.defaultManager containerURLForSecurityApplicationGroupIdentifier:[NSClassFromString(@"LCSharedUtils") appGroupID]] path];
     isLiveProcess = [lcAppUrlScheme isEqualToString:@"liveprocess"];
     setenv("LC_HOME_PATH", getenv("HOME"), 0);
-
-    if (!isLiveProcess && getenv("HOME")) {
-        [lcSharedDefaults setObject:@(getenv("HOME")) forKey:@"hostHomePath"];
-    }
 
     NSString *selectedApp = [lcUserDefaults stringForKey:@"selected"];
     NSString *selectedContainer = [lcUserDefaults stringForKey:@"selectedContainer"];
@@ -864,13 +880,14 @@ int LiveContainerMain(int argc, char *argv[]) {
                     NSURL* url = [NSURL URLWithString: finalUrl];
                     
                     [[NSClassFromString(@"UIApplication") sharedApplication] openURL:url options:@{} completionHandler:nil];
-
                 }
             }
         });
-
     }
-    NSSetUncaughtExceptionHandler(&exceptionHandler);
+
+    // 初始化強化的 Crash 處理器（含 Uncaught Exception 與 POSIX Signals）
+    setupCrashHandlers();
+
     if (selectedApp || isSideStore) {
         [lcUserDefaults removeObjectForKey:@"selected"];
         [lcUserDefaults removeObjectForKey:@"selectedContainer"];
@@ -880,12 +897,12 @@ int LiveContainerMain(int argc, char *argv[]) {
         }
         NSString *appError = invokeAppMain(selectedApp, selectedContainer, argc, argv);
         if (appError) {
-            handleAndCopyAppError(appError);
-            
             if(isLiveProcess) {
-                // 已刪除 dispatch_after 與 exit(1)
-                // 透過 showPersistentErrorAlert 彈出視窗並保持 RunLoop，畫面將不會關閉
-                showPersistentErrorAlert(appError);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(100 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+                    NSExtensionContext *context = [NSClassFromString(@"LiveProcessHandler") extensionContext];
+                    [context cancelRequestWithError:[NSError errorWithDomain:@"LiveProcess" code:1 userInfo:@{NSLocalizedDescriptionKey: appError}]];
+                    exit(1);
+                });
                 CFRunLoopRun();
             } else {
                 [lcUserDefaults setObject:appError forKey:@"error"];
@@ -942,7 +959,6 @@ int LiveContainerMain(int argc, char *argv[]) {
 
     int (*LiveContainerSwiftUIMain)(void) = dlsym(LiveContainerSwiftUIHandle, "main");
     return LiveContainerSwiftUIMain();
-
 }
 
 #ifdef DEBUG
