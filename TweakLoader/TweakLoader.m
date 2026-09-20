@@ -57,44 +57,23 @@ static void loadTweaksRecursively(NSURL *folderURL, NSMutableArray *errors) {
 }
 
 static void showDlerrAlert(NSString *error) {
-    if (!error) return;
-
-    // 1. 保險措施：觸發時立刻自動複製到剪貼簿，即使選單閃退也能直接貼上
-    [UIPasteboard.generalPasteboard setString:error];
-    
-    // 2. 保險措施：同步將錯誤日誌寫入本地檔案 (例如 /tmp/tweak_error.log)
-    NSString *logPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"tweak_error.log"];
-    [error writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    
-    NSLog(@"[TweakLoader] Error occurred and logged to clipboard & %@", logPath);
-
-    // 3. 彈出原生分享面板 (UIActivityViewController)
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
-        window.rootViewController = [UIViewController new];
-        window.windowLevel = 1000;
-        window.windowScene = (id)UIApplication.sharedApplication.connectedScenes.anyObject;
-        [window makeKeyAndVisible];
-
-        // 建立分享面板（可分享錯誤文字與 log 檔案）
-        NSURL *logURL = [NSURL fileURLWithPath:logPath];
-        UIActivityViewController *activityVC = [[UIActivityViewController alloc] initWithActivityItems:@[error, logURL] applicationActivities:nil];
-        
-        // 針對 iPad 視窗適配
-        if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
-            activityVC.popoverPresentationController.sourceView = window.rootViewController.view;
-            activityVC.popoverPresentationController.sourceRect = CGRectMake(window.rootViewController.view.bounds.size.width / 2, window.rootViewController.view.bounds.size.height / 2, 0, 0);
-            activityVC.popoverPresentationController.permittedArrowDirections = 0;
-        }
-
-        // 當分享選單關閉時清理臨時 window
-        activityVC.completionWithItemsHandler = ^(UIActivityType activityType, BOOL completed, NSArray *returnedItems, NSError *activityError) {
-            window.windowScene = nil;
-        };
-
-        [window.rootViewController presentViewController:activityVC animated:YES completion:nil];
-        objc_setAssociatedObject(activityVC, @"window", window, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    });
+    UIWindow *window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Failed to load tweaks" message:error preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertAction* okAction = [UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * action) {
+        window.windowScene = nil;
+    }];
+    [alert addAction:okAction];
+    UIAlertAction* cancelAction = [UIAlertAction actionWithTitle:@"Copy" style:UIAlertActionStyleCancel handler:^(UIAlertAction * action) {
+        UIPasteboard.generalPasteboard.string = error;
+        window.windowScene = nil;
+    }];
+    [alert addAction:cancelAction];
+    window.rootViewController = [UIViewController new];
+    window.windowLevel = 1000;
+    window.windowScene = (id)UIApplication.sharedApplication.connectedScenes.anyObject;
+    [window makeKeyAndVisible];
+    [window.rootViewController presentViewController:alert animated:YES completion:nil];
+    objc_setAssociatedObject(alert, @"window", window, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
  __attribute__((constructor))
