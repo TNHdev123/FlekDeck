@@ -18,14 +18,8 @@
 #import "Tweaks/Tweaks.h"
 #include <mach-o/ldsyms.h>
 
-static int (*appMain)(int, char**);
-
-// Mirrors AccessVerdictStore.defaultGraceWindow / .maximumGraceWindow in
-// LiveContainerSwiftUI. Kept in sync by hand: the bootstrap runs before any
-// Swift is loaded, so it cannot read the constants from there.
-static const NSTimeInterval kDefaultOfflineGraceWindow = 3 * 24 * 60 * 60;
-static const NSTimeInterval kMaximumOfflineGraceWindow = 30 * 24 * 60 * 60;
-
+extern char **environ;
+static int (*appMain)(int, char**, char**);
 NSUserDefaults *lcUserDefaults;
 NSUserDefaults *lcSharedDefaults;
 NSString *lcAppGroupPath;
@@ -96,14 +90,10 @@ static BOOL checkJITEnabled() {
         return NO;
     }
     // check if jailbroken
-    if (access("/var/mobile", R_OK) == 0) {
+    if (access("/usr/lib/systemhook.dylib", R_OK) == 0) {
         return YES;
     }
     
-    if(@available(iOS 26.0 ,*))  {
-        return false;
-    }
-
     // check csflags
     int flags;
     csops(getpid(), 0, &flags, sizeof(flags));
@@ -258,50 +248,6 @@ static void *getAppEntryPoint(void *handle) {
     return (void *)header + entryoff;
 }
 
-// Access gate for guest app launches.
-//
-// The SwiftUI launcher can only refuse to draw its own UI. A guest app started
-// from the "Launch App" Shortcuts intent, or from a leftover "selected" key,
-// reaches invokeAppMain() below without LiveContainerSwiftUI ever being loaded,
-// so the check there never runs. This is the one point every launch path passes
-// through, which makes it the only place a ban can actually be enforced.
-//
-// Cache only, never network: this sits on the launch path of every guest app
-// and must not add latency or fail when offline. LiveContainerSwiftUI owns
-// refreshing the cached verdict; see AccessVerdictStore, whose keys these are.
-static BOOL isGuestLaunchAllowed(NSUserDefaults *sharedDefaults) {
-    NSNumber *checkedAt = [sharedDefaults objectForKey:@"FSAccessVerdictCheckedAt"];
-    // Nothing has ever been verified on this install. Allow, so that a launch
-    // path which legitimately cannot see the cache is not bricked by this
-    // check; the SwiftUI gate still applies the first time the launcher opens.
-    if (!checkedAt) {
-        return YES;
-    }
-
-    // A ban is sticky and has no expiry, matching the Swift side: going offline
-    // or leaving the app closed must not be a way to shed it.
-    if ([sharedDefaults boolForKey:@"FSAccessVerdictIsBanned"]) {
-        return NO;
-    }
-
-    NSTimeInterval age = NSDate.date.timeIntervalSince1970 - checkedAt.doubleValue;
-    // A clock wound backwards shows up as a negative age. Treat it as expired
-    // rather than as an arbitrarily fresh verdict.
-    if (age < 0) {
-        return NO;
-    }
-
-    NSNumber *storedWindow = [sharedDefaults objectForKey:@"FSAccessVerdictGraceWindow"];
-    NSTimeInterval window = storedWindow ? storedWindow.doubleValue : kDefaultOfflineGraceWindow;
-    if (window < 0) {
-        window = 0;
-    } else if (window > kMaximumOfflineGraceWindow) {
-        window = kMaximumOfflineGraceWindow;
-    }
-
-    return age <= window;
-}
-
 static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContainer, int argc, char *argv[]) {
     NSString *appError = nil;
     if([[lcUserDefaults objectForKey:@"LCWaitForDebugger"] boolValue]) {
@@ -310,7 +256,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     if (!LCSharedUtils.certificatePassword && !isSideStore) {
 #if !TARGET_OS_SIMULATOR
         if(@available(iOS 26.0 ,*))  {
-            return @"JITLess mode is required since iOS 26. Please set it up in settings. \nPlease go to FlekDeck settings -> tap \"Import Flekstore certificate\" / \"Import Certificate\"";
+            return @"JITLess mode is required since iOS 26. Please set it up in settings. \nPlease go to LiveContainer settings -> tap \"Import Certificate from SideStore\" / \"Import Certificate\"";
         }
 #endif
         // First of all, let's check if we have JIT
@@ -318,7 +264,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
             usleep(1000*100);
         }
         if (!checkJITEnabled()) {
-            appError = @"JIT was not enabled. If you want to use FlekDeck without JIT, setup JITLess mode in settings.";
+            appError = @"JIT was not enabled. If you want to use LiveContainer without JIT, setup JITLess mode in settings.";
             return appError;
         }
     }
@@ -459,7 +405,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
                     [lcUserDefaults setObject:@"Bookmark resolution timed out. Is the data storage offline?" forKey:@"error"];
                     NSError* err = nil;
                     BOOL isStale = false;
-                    bookmarkURL = [NSURL URLByResolvingBookmarkData:bookmarkData options:(1<<10) relativeToURL:nil bookmarkDataIsStale:&isStale error:&err];
+                    bookmarkURL = [NSURL URLByResolvingBookmarkData:bookmarkData options:0 relativeToURL:nil bookmarkDataIsStale:&isStale error:&err];
                     bool access = [bookmarkURL startAccessingSecurityScopedResource];
                     if(!bookmarkURL || !access) {
                         return [@"Bookmark resolution failed or unable to access the container. You might need to readd the data storage. %@" stringByAppendingString:err.localizedDescription];
@@ -570,21 +516,6 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         NSFMGuestHooksInit();
         initDead10ccFix();
     }
-    // No-op outside LiveProcess, and once the appex carries the key itself.
-    LCHostIdentityInit();
-    // Per-window mute, and mixable audio sessions so two guests can be heard at
-    // once. Only a LiveProcess guest is ever in a multitask window.
-    if(isLiveProcess && !isSideStore) {
-        LCAudioMuteInit(dataUUID);
-        // The guest cannot hold a PiP window of its own — see LCGuestPiP.m — so
-        // its requests are handed to the host, which can.
-        LCGuestPiPInit(dataUUID);
-        // Nor can it record — see LCGuestCapture.m. The window says so rather
-        // than letting the app fall silent with no explanation.
-        LCGuestCaptureInit(dataUUID);
-    }
-    // Background downloads inside LiveProcess get our app group forced onto
-    // their session configuration, which is what makes them complete.
     if(isLiveProcess) {
         NSURLSCGuestHooksInit();
     }
@@ -604,31 +535,34 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         }
     }
     
-#if is32BitSupported
     bool is32bit = [guestAppInfo[@"is32bit"] boolValue];
     if(is32bit) {
+        [lcUserDefaults removeObjectForKey:@"LC32BitTranslationLayerLogFile"];
         if (!isJitEnabled) {
             return @"JIT is required to run 32-bit apps.";
         }
         
-        NSString *selected32BitLayer = [lcSharedDefaults stringForKey:@"selected32BitLayer"];
-        if(!selected32BitLayer || [selected32BitLayer length] == 0) {
-            appError = @"No 32-bit translation layer installed";
+        NSString *selected32BitLayer = guestAppInfo[@"selected32BitEmulator"] ?: [lcSharedDefaults stringForKey:@"LCSelected32BitEmulator"];
+        if(selected32BitLayer.length == 0) {
+            appError = @"No 32-bit emulator selected";
             NSLog(@"[LCBootstrap] %@", appError);
             *path = oldPath;
             return appError;
         }
-        NSBundle *selected32bitLayerBundle = [NSBundle bundleWithPath:[docPath stringByAppendingPathComponent:selected32BitLayer]]; //TODO make it user friendly;
+        NSBundle *selected32bitLayerBundle = [NSBundle bundleWithPath:[NSString stringWithFormat:@"%@/Applications/%@", docPath, selected32BitLayer]];
         if(!selected32bitLayerBundle) {
-            appError = @"The specified LiveExec32.app path is not found";
+            selected32bitLayerBundle = [NSBundle bundleWithPath:[NSString stringWithFormat:@"%@/Applications/%@", appGroupFolder.path, selected32BitLayer]];
+        }
+        if(!selected32bitLayerBundle) {
+            appError = @"The specified 32-bit emulator app is not found";
             NSLog(@"[LCBootstrap] %@", appError);
             *path = oldPath;
             return appError;
         }
         // maybe need to save selected32bitLayerBundle to static variable?
         appExecPath = strdup(selected32bitLayerBundle.executablePath.UTF8String);
+        overwriteExecPath(appExecPath);
     }
-#endif
     if(![guestAppInfo[@"dontInjectTweakLoader"] boolValue]) {
         tweakLoaderLoaded = true;
     }
@@ -688,12 +622,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     [NSUserDefaults performSelector:@selector(initialize)];
 
     // Attempt to load the bundle. 32-bit bundle will always fail because of 32-bit main executable, so ignore it
-    if (
-#if is32BitSupported
-        !is32bit &&
-#endif
-        ![appBundle loadAndReturnError:&error]
-        ) {
+    if (!is32bit && ![appBundle loadAndReturnError:&error]) {
         appError = error.localizedDescription;
         NSLog(@"[LCBootstrap] loading bundle failed: %@", error);
         *path = oldPath;
@@ -713,17 +642,13 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     // Go!
     NSLog(@"[LCBootstrap] jumping to main %p", appMain);
     int ret;
-#if is32BitSupported
     if(!is32bit) {
-#endif
         argv[0] = (char *)appExecPath;
-        ret = appMain(argc, argv);
-#if is32BitSupported
+        ret = appMain(argc, argv, environ);
     } else {
         char *argv32[] = {(char*)appExecPath, (char*)*path, NULL};
-        ret = appMain(sizeof(argv32)/sizeof(*argv32) - 1, argv32);
+        ret = appMain(sizeof(argv32)/sizeof(*argv32) - 1, argv32, environ);
     }
-#endif
     return [NSString stringWithFormat:@"App returned from its main function with code %d.", ret];
 }
 
@@ -808,21 +733,7 @@ int LiveContainerMain(int argc, char *argv[]) {
         [lcUserDefaults removeObjectForKey:@"selected"];
         [lcUserDefaults removeObjectForKey:@"selectedContainer"];
     }
-
-    if((selectedApp || [lcUserDefaults boolForKey:@"LCOpenSideStore"]) && !isGuestLaunchAllowed(lcSharedDefaults)) {
-        // Drop the pending launch and fall through to LiveContainerSwiftUI,
-        // which re-checks online and explains itself with the blocked or the
-        // verification screen. Under LiveProcess there is no UI to fall through
-        // to, so the multitask window closes instead.
-        selectedApp = nil;
-        selectedContainer = nil;
-        launchUrl = nil;
-        [lcUserDefaults removeObjectForKey:@"selected"];
-        [lcUserDefaults removeObjectForKey:@"selectedContainer"];
-        [lcUserDefaults removeObjectForKey:@"launchAppUrlScheme"];
-        [lcUserDefaults setBool:NO forKey:@"LCOpenSideStore"];
-    }
-
+    
     if(isLiveProcess) {
         sideStoreExist = [NSFileManager.defaultManager fileExistsAtPath:[lcMainBundle.bundlePath stringByAppendingPathComponent:@"../../Frameworks/SideStoreApp.framework"]];
     } else {
@@ -842,7 +753,7 @@ int LiveContainerMain(int argc, char *argv[]) {
     }
     NSString* runningLC = [LCSharedUtils getContainerUsingLCSchemeWithFolderName:selectedContainer];
     // if another instance is running, we just switch to that one, these should be called after uiapplication initialized
-    // however if the running lc is liveprocess and current lc is flekdeck1 we just continue
+    // however if the running lc is liveprocess and current lc is livecontainer1 we just continue
     if(selectedApp && runningLC) {
         [lcUserDefaults removeObjectForKey:@"selected"];
         [lcUserDefaults removeObjectForKey:@"selectedContainer"];
@@ -966,8 +877,8 @@ int LiveContainerMain(int argc, char *argv[]) {
 }
 
 #ifdef DEBUG
-int callAppMain(int argc, char *argv[]) {
+int callAppMain(int argc, char *argv[], char *envp[]) {
     assert(appMain != NULL);
-    __attribute__((musttail)) return appMain(argc, argv);
+    __attribute__((musttail)) return appMain(argc, argv, envp);
 }
 #endif
